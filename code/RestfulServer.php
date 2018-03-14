@@ -60,7 +60,7 @@ class RestfulServer extends Controller
      *
      * @var array
      */
-    protected static $allowed_sort_params = array('Created', 'PublishDate');
+    protected static $allowed_sort_params = array('Created', 'PublishDate', 'Sort');
 
     /**
      * Dir params that are acceptable for filtering.
