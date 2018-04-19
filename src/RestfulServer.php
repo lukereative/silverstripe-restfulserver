@@ -1,44 +1,62 @@
 <?php
+
+namespace SilverStripe\RestfulServer;
+
+use SilverStripe\ORM\ArrayList;
+use SilverStripe\Core\Config\Config;
+use SilverStripe\Control\Controller;
+use SilverStripe\ORM\DataList;
+use SilverStripe\ORM\DataObject;
+use SilverStripe\Control\Director;
+use SilverStripe\Control\HTTPRequest;
+use SilverStripe\ORM\SS_List;
+use SilverStripe\ORM\ValidationException;
+use SilverStripe\ORM\ValidationResult;
+use SilverStripe\Security\Member;
+use SilverStripe\Security\Security;
+use SilverStripe\CMS\Model\SiteTree;
+
 /**
  * Generic RESTful server, which handles webservice access to arbitrary DataObjects.
  * Relies on serialization/deserialization into different formats provided
  * by the DataFormatter APIs in core.
- * 
- * @todo Finish RestfulServer_Item and RestfulServer_List implementation and re-enable $url_handlers
+ *
  * @todo Implement PUT/POST/DELETE for relations
- * @todo Access-Control for relations (you might be allowed to view Members and Groups, 
+ * @todo Access-Control for relations (you might be allowed to view Members and Groups,
  *       but not their relation with each other)
  * @todo Make SearchContext specification customizeable for each class
  * @todo Allow for range-searches (e.g. on Created column)
  * @todo Filter relation listings by $api_access and canView() permissions
- * @todo Exclude relations when "fields" are specified through URL (they should be explicitly 
+ * @todo Exclude relations when "fields" are specified through URL (they should be explicitly
  *       requested in this case)
- * @todo Custom filters per DataObject subclass, e.g. to disallow showing unpublished pages in 
+ * @todo Custom filters per DataObject subclass, e.g. to disallow showing unpublished pages in
  * SiteTree/Versioned/Hierarchy
- * @todo URL parameter namespacing for search-fields, limit, fields, add_fields 
+ * @todo URL parameter namespacing for search-fields, limit, fields, add_fields
  *       (might all be valid dataobject properties)
- *       e.g. you wouldn't be able to search for a "limit" property on your subclass as 
+ *       e.g. you wouldn't be able to search for a "limit" property on your subclass as
  *       its overlayed with the search logic
  * @todo i18n integration (e.g. Page/1.xml?lang=de_DE)
  * @todo Access to extendable methods/relations like SiteTree/1/Versions or SiteTree/1/Version/22
  * @todo Respect $api_access array notation in search contexts
- * @todo Make $allowed_sort_params a configurable option
- * @todo Make $allowed_dir_params a configurable option
- * 
- * @package framework
- * @subpackage api
  */
 class RestfulServer extends Controller
 {
-    public static $url_handlers = array(
-        '$ClassName/$ID/$Relation' => 'handleAction'
-        #'$ClassName/#ID' => 'handleItem',
-        #'$ClassName' => 'handleList',
+    private static $url_handlers = array(
+        '$ClassName!/$ID/$Relation' => 'handleAction',
+        '' => 'notFound'
     );
 
-    protected static $api_base = "api/v1/";
+    /**
+     * @config
+     * @var string root of the api route, MUST have a trailing slash
+     */
+    private static $api_base = "api/v1/";
 
-    protected static $authenticator = 'BasicRestfulAuthenticator';
+    /**
+     * @config
+     * @var string Class name for an authenticator to use on API access
+     */
+    private static $authenticator = BasicRestfulAuthenticator::class;
 
     /**
      * If no extension is given in the request, resolve to this extension
@@ -46,8 +64,8 @@ class RestfulServer extends Controller
      *
      * @var string
      */
-    public static $default_extension = "xml";
-    
+    private static $default_extension = "xml";
+
     /**
      * If no extension is given, resolve the request to this mimetype.
      *
@@ -56,38 +74,15 @@ class RestfulServer extends Controller
     protected static $default_mimetype = "text/xml";
 
     /**
-     * Sort params that are acceptable for filtering.
-     *
-     * @var array
-     */
-    protected static $allowed_sort_params = array('Created', 'PublishDate', 'Sort');
-
-    /**
-     * Dir params that are acceptable for filtering.
-     *
-     * @var array
-     */
-    protected static $allowed_dir_params = array('asc', 'desc');
-    
-    /**
      * @uses authenticate()
      * @var Member
      */
     protected $member;
-    
-    public static $allowed_actions = array(
-        'index'
-    );
-    
-    /*
-    function handleItem($request) {
-        return new RestfulServer_Item(DataObject::get_by_id($request->param("ClassName"), $request->param("ID")));
-    }
 
-    function handleList($request) {
-        return new RestfulServer_List(DataObject::get($request->param("ClassName"),""));
-    }
-    */
+    private static $allowed_actions = array(
+        'index',
+        'notFound'
+    );
 
     public function init()
     {
@@ -95,25 +90,74 @@ class RestfulServer extends Controller
          * to Stage, and then when viewing the front-end Versioned::choose_site_stage changes it to Live.
          * TODO: In 3.2 we should make the default Live, then change to Stage in the admin area (with a nicer API)
          */
-        if (class_exists('SiteTree')) {
-            singleton('SiteTree')->extend('modelascontrollerInit', $this);
+        if (class_exists(SiteTree::class)) {
+            singleton(SiteTree::class)->extend('modelascontrollerInit', $this);
         }
         parent::init();
+    }
+
+    /**
+     * Backslashes in fully qualified class names (e.g. NameSpaced\ClassName)
+     * kills both requests (i.e. URIs) and XML (invalid character in a tag name)
+     * So we'll replace them with a hyphen (-), as it's also unambiguious
+     * in both cases (invalid in a php class name, and safe in an xml tag name)
+     *
+     * @param string $classname
+     * @return string 'escaped' class name
+     */
+    protected function sanitiseClassName($className)
+    {
+        return str_replace('\\', '-', $className);
+    }
+
+    /**
+     * Convert hyphen escaped class names back into fully qualified
+     * PHP safe variant.
+     *
+     * @param string $classname
+     * @return string syntactically valid classname
+     */
+    protected function unsanitiseClassName($className)
+    {
+        return str_replace('-', '\\', $className);
+    }
+
+    /**
+     * Parse many many relation class (works with through array syntax)
+     *
+     * @param string|array $class
+     * @return string|array
+     */
+    public static function parseRelationClass($class)
+    {
+        // detect many many through syntax
+        if (is_array($class)
+            && array_key_exists('through', $class)
+            && array_key_exists('to', $class)
+        ) {
+            $toRelation = $class['to'];
+
+            $hasOne = Config::inst()->get($class['through'], 'has_one');
+            if (empty($hasOne) || !is_array($hasOne) || !array_key_exists($toRelation, $hasOne)) {
+                return $class;
+            }
+
+            return $hasOne[$toRelation];
+        }
+
+        return $class;
     }
 
     /**
      * This handler acts as the switchboard for the controller.
      * Since no $Action url-param is set, all requests are sent here.
      */
-    public function index()
+    public function index(HTTPRequest $request)
     {
-        if (!isset($this->urlParams['ClassName'])) {
-            return $this->notFound();
-        }
-        $className = $this->urlParams['ClassName'];
-        $id = (isset($this->urlParams['ID'])) ? $this->urlParams['ID'] : null;
-        $relation = (isset($this->urlParams['Relation'])) ? $this->urlParams['Relation'] : null;
-        
+        $className = $this->unsanitiseClassName($request->param('ClassName'));
+        $id = $request->param('ID') ?: null;
+        $relation = $request->param('Relation') ?: null;
+
         // Check input formats
         if (!class_exists($className)) {
             return $this->notFound();
@@ -121,15 +165,14 @@ class RestfulServer extends Controller
         if ($id && !is_numeric($id)) {
             return $this->notFound();
         }
-        if (
-            $relation
+        if ($relation
             && !preg_match('/^[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*$/', $relation)
-            ) {
+        ) {
             return $this->notFound();
         }
-        
+
         // if api access is disabled, don't proceed
-        $apiAccess = singleton($className)->stat('api_access');
+        $apiAccess = Config::inst()->get($className, 'api_access');
         if (!$apiAccess) {
             return $this->permissionFailure();
         }
@@ -137,30 +180,34 @@ class RestfulServer extends Controller
         // authenticate through HTTP BasicAuth
         $this->member = $this->authenticate();
 
-        // handle different HTTP verbs
-        if ($this->request->isGET() || $this->request->isHEAD()) {
-            return $this->getHandler($className, $id, $relation);
-        }
-        
-        if ($this->request->isPOST()) {
-            return $this->postHandler($className, $id, $relation);
-        }
-        
-        if ($this->request->isPUT()) {
-            return $this->putHandler($className, $id, $relation);
-        }
+        try {
+            // handle different HTTP verbs
+            if ($this->request->isGET() || $this->request->isHEAD()) {
+                return $this->getHandler($className, $id, $relation);
+            }
 
-        if ($this->request->isDELETE()) {
-            return $this->deleteHandler($className, $id, $relation);
+            if ($this->request->isPOST()) {
+                return $this->postHandler($className, $id, $relation);
+            }
+
+            if ($this->request->isPUT()) {
+                return $this->putHandler($className, $id, $relation);
+            }
+
+            if ($this->request->isDELETE()) {
+                return $this->deleteHandler($className, $id, $relation);
+            }
+        } catch (\Exception $e) {
+            return $this->exceptionThrown($this->getRequestDataFormatter($className), $e);
         }
 
         // if no HTTP verb matches, return error
         return $this->methodNotAllowed();
     }
-    
+
     /**
      * Handler for object read.
-     * 
+     *
      * The data object will be returned in the following format:
      *
      * <ClassName>
@@ -180,16 +227,16 @@ class RestfulServer extends Controller
      * </ClassName>
      *
      * Access is controlled by two variables:
-     * 
+     *
      *   - static $api_access must be set. This enables the API on a class by class basis
      *   - $obj->canView() must return true. This lets you implement record-level security
-     * 
+     *
      * @todo Access checking
-     * 
-     * @param String $className
+     *
+     * @param string $className
      * @param Int $id
-     * @param String $relation
-     * @return String The serialized representation of the requested object(s) - usually XML or JSON.
+     * @param string $relation
+     * @return string The serialized representation of the requested object(s) - usually XML or JSON.
      */
     protected function getHandler($className, $id, $relationName)
     {
@@ -199,19 +246,19 @@ class RestfulServer extends Controller
             $dir = $this->getDirQuery();
             $sort = array($this->getSortQuery() => ($dir ? $dir : 'ASC'));
         }
-        
+
         $limit = array(
             'start' => $this->request->getVar('start'),
             'limit' => $this->request->getVar('limit')
         );
-        
+
         $params = $this->request->getVars();
-        
+
         $responseFormatter = $this->getResponseDataFormatter($className);
         if (!$responseFormatter) {
             return $this->unsupportedMediaType();
         }
-        
+
         // $obj can be either a DataObject or a SS_List,
         // depending on the request
         if ($id) {
@@ -220,7 +267,7 @@ class RestfulServer extends Controller
             if (!$obj) {
                 return $this->notFound();
             }
-            if (!$obj->canView()) {
+            if (!$obj->canView($this->getMember())) {
                 return $this->permissionFailure();
             }
 
@@ -230,7 +277,7 @@ class RestfulServer extends Controller
                 if (!$obj) {
                     return $this->notFound();
                 }
-                
+
                 // TODO Avoid creating data formatter again for relation class (see above)
                 $responseFormatter = $this->getResponseDataFormatter($obj->dataClass());
             }
@@ -238,79 +285,50 @@ class RestfulServer extends Controller
             // Format: /api/v1/<MyClass>
             $obj = $this->getObjectsQuery($className, $params, $sort, $limit);
         }
-        
+
         $this->getResponse()->addHeader('Content-Type', $responseFormatter->getOutputContentType());
-        
+
         $rawFields = $this->request->getVar('fields');
-        $fields = $rawFields ? explode(',', $rawFields) : null;
+        $realFields = $responseFormatter->getRealFields($className, explode(',', $rawFields));
+        $fields = $rawFields ? $realFields : null;
 
         if ($obj instanceof SS_List) {
-            $responseFormatter->setTotalSize($obj->dataQuery()->query()->unlimitedRowCount());
-            $objs = new ArrayList($obj->toArray());
+            $objs = ArrayList::create($obj->toArray());
             foreach ($objs as $obj) {
-                if (!$obj->canView()) {
+                if (!$obj->canView($this->getMember())) {
                     $objs->remove($obj);
                 }
             }
+            $responseFormatter->setTotalSize($objs->count());
             return $responseFormatter->convertDataObjectSet($objs, $fields);
-        } elseif (!$obj) {
+        }
+
+        if (!$obj) {
             $responseFormatter->setTotalSize(0);
             return $responseFormatter->convertDataObjectSet(new ArrayList(), $fields);
-        } else {
-            return $responseFormatter->convertDataObject($obj, $fields);
         }
+
+        return $responseFormatter->convertDataObject($obj, $fields);
     }
 
-    /**
-     * Ensures that the url param passed for the sort param is valid.
-     * This is to prevent sql injection.
-     *
-     * @return array|user_error|null
-     */
-    protected function getSortQuery()
-    {
-        $sortQuery = $this->request->getVar('sort');
-        if (in_array($sortQuery, self::$allowed_sort_params)) {
-            return $sortQuery;
-        } else if ($sortQuery) {
-            user_error('Disallowed Sort parameter', E_USER_ERROR);
-        } else {
-            return null;
-        }
-    }
-
-    /**
-     * Ensures that the url param passed for the dir param is valid.
-     * This is to prevent sql injection.
-     *
-     * @return array|user_error|null
-     */
-    protected function getDirQuery()
-    {
-        $dirQuery = $this->request->getVar('dir');
-        if (in_array(strtolower($dirQuery), self::$allowed_dir_params)) {
-            return $dirQuery;
-        } else if ($dirQuery) {
-            user_error('Disallowed Dir parameter', E_USER_ERROR);
-        } else {
-            return null;
-        }
-    }
-    
     /**
      * Uses the default {@link SearchContext} specified through
      * {@link DataObject::getDefaultSearchContext()} to augument
      * an existing query object (mostly a component query from {@link DataObject})
-     * with search clauses. 
-     * 
+     * with search clauses.
+     *
      * @todo Allow specifying of different searchcontext getters on model-by-model basis
      *
      * @param string $className
      * @param array $params
      * @return SS_List
      */
-    protected function getSearchQuery($className, $params = null, $sort = null,
-        $limit = null, $existingQuery = null
+    protected function getSearchQuery(
+        $className,
+        $params = null,
+        $sort = null,
+        $limit = null,
+        $existingQuery = null
     ) {
         if (singleton($className)->hasMethod('getRestfulSearchContext')) {
             $searchContext = singleton($className)->{'getRestfulSearchContext'}();
@@ -319,13 +337,13 @@ class RestfulServer extends Controller
         }
         return $searchContext->getQuery($params, $sort, $limit, $existingQuery);
     }
-    
+
     /**
      * Returns a dataformatter instance based on the request
      * extension or mimetype. Falls back to {@link self::$default_extension}.
-     * 
-     * @param boolean $includeAcceptHeader Determines wether to inspect and prioritize any HTTP Accept headers 
-     * @param String Classname of a DataObject
+     *
+     * @param boolean $includeAcceptHeader Determines wether to inspect and prioritize any HTTP Accept headers
+     * @param string Classname of a DataObject
      * @return DataFormatter
      */
     protected function getDataFormatter($includeAcceptHeader = false, $className = null)
@@ -337,37 +355,39 @@ class RestfulServer extends Controller
         $accept = $this->request->getHeader('Accept');
         $mimetypes = $this->request->getAcceptMimetypes();
         if (!$className) {
-            $className = $this->urlParams['ClassName'];
+            $className = $this->unsanitiseClassName($this->request->param('ClassName'));
         }
 
         // get formatter
         if (!empty($extension)) {
             $formatter = DataFormatter::for_extension($extension);
-        } elseif ($includeAcceptHeader && !empty($accept) && $accept != '*/*') {
+        } elseif ($includeAcceptHeader && !empty($accept) && strpos($accept, '*/*') === false) {
             $formatter = DataFormatter::for_mimetypes($mimetypes);
             if (!$formatter) {
-                $formatter = DataFormatter::for_extension(self::$default_extension);
+                $formatter = DataFormatter::for_extension($this->config()->default_extension);
             }
         } elseif (!empty($contentType)) {
             $formatter = DataFormatter::for_mimetype($contentType);
         } else {
-            $formatter = DataFormatter::for_extension(self::$default_extension);
+            $formatter = DataFormatter::for_extension($this->config()->default_extension);
         }
 
         if (!$formatter) {
             return false;
         }
-        
+
         // set custom fields
         if ($customAddFields = $this->request->getVar('add_fields')) {
-            $formatter->setCustomAddFields(explode(',', $customAddFields));
+            $customAddFields = $formatter->getRealFields($className, explode(',', $customAddFields));
+            $formatter->setCustomAddFields($customAddFields);
         }
         if ($customFields = $this->request->getVar('fields')) {
-            $formatter->setCustomFields(explode(',', $customFields));
+            $customFields = $formatter->getRealFields($className, explode(',', $customFields));
+            $formatter->setCustomFields($customFields);
         }
         $formatter->setCustomRelations($this->getAllowedRelations($className));
-        
-        $apiAccess = singleton($className)->stat('api_access');
+
+        $apiAccess = Config::inst()->get($className, 'api_access');
         if (is_array($apiAccess)) {
             $formatter->setCustomAddFields(
                 array_intersect((array)$formatter->getCustomAddFields(), (array)$apiAccess['view'])
@@ -393,28 +413,28 @@ class RestfulServer extends Controller
         if (is_numeric($relationDepth)) {
             $formatter->relationDepth = (int)$relationDepth;
         }
-        
+
         return $formatter;
     }
-    
+
     /**
-     * @param String Classname of a DataObject
+     * @param string Classname of a DataObject
      * @return DataFormatter
      */
     protected function getRequestDataFormatter($className = null)
     {
         return $this->getDataFormatter(false, $className);
     }
-    
+
     /**
-     * @param String Classname of a DataObject
+     * @param string Classname of a DataObject
      * @return DataFormatter
      */
     protected function getResponseDataFormatter($className = null)
     {
         return $this->getDataFormatter(true, $className);
     }
-    
+
     /**
      * Handler for object delete
      */
@@ -424,12 +444,12 @@ class RestfulServer extends Controller
         if (!$obj) {
             return $this->notFound();
         }
-        if (!$obj->canDelete()) {
+        if (!$obj->canDelete($this->getMember())) {
             return $this->permissionFailure();
         }
-        
+
         $obj->delete();
-        
+
         $this->getResponse()->setStatusCode(204); // No Content
         return true;
     }
@@ -443,22 +463,32 @@ class RestfulServer extends Controller
         if (!$obj) {
             return $this->notFound();
         }
-        if (!$obj->canEdit()) {
+
+        if (!$obj->canEdit($this->getMember())) {
             return $this->permissionFailure();
         }
-        
+
         $reqFormatter = $this->getRequestDataFormatter($className);
         if (!$reqFormatter) {
             return $this->unsupportedMediaType();
         }
-        
+
         $responseFormatter = $this->getResponseDataFormatter($className);
         if (!$responseFormatter) {
             return $this->unsupportedMediaType();
         }
-        
-        $obj = $this->updateDataObject($obj, $reqFormatter);
-        
+
+        try {
+            /** @var DataObject|string */
+            $obj = $this->updateDataObject($obj, $reqFormatter);
+        } catch (ValidationException $e) {
+            return $this->validationFailure($responseFormatter, $e->getResult());
+        }
+
+        if (is_string($obj)) {
+            return $obj;
+        }
+
         $this->getResponse()->setStatusCode(200); // Success
         $this->getResponse()->addHeader('Content-Type', $responseFormatter->getOutputContentType());
 
@@ -470,15 +500,17 @@ class RestfulServer extends Controller
             $type = ".{$types[0]}";
         }
 
-        $objHref = Director::absoluteURL(self::$api_base . "$obj->class/$obj->ID" . $type);
+        $urlSafeClassName = $this->sanitiseClassName(get_class($obj));
+        $apiBase = $this->config()->api_base;
+        $objHref = Director::absoluteURL($apiBase . "$urlSafeClassName/$obj->ID" . $type);
         $this->getResponse()->addHeader('Location', $objHref);
-        
+
         return $responseFormatter->convertDataObject($obj);
     }
 
     /**
      * Handler for object append / method call.
-     * 
+     *
      * @todo Posting to an existing URL (without a relation)
      * current resolves in creatig a new element,
      * rather than a "Conflict" message.
@@ -490,57 +522,76 @@ class RestfulServer extends Controller
                 $this->response->setStatusCode(409);
                 return 'Conflict';
             }
-            
+
             $obj = DataObject::get_by_id($className, $id);
             if (!$obj) {
                 return $this->notFound();
             }
-            
-            if (!$obj->hasMethod($relation)) {
-                return $this->notFound();
-            }
-            
-            if (!$obj->stat('allowed_actions') || !in_array($relation, $obj->stat('allowed_actions'))) {
-                return $this->permissionFailure();
-            }
-            
-            $obj->$relation();
-            
-            $this->getResponse()->setStatusCode(204); // No Content
-            return true;
-        } else {
-            if (!singleton($className)->canCreate()) {
-                return $this->permissionFailure();
-            }
-            $obj = new $className();
-        
+
             $reqFormatter = $this->getRequestDataFormatter($className);
             if (!$reqFormatter) {
                 return $this->unsupportedMediaType();
             }
-        
-            $responseFormatter = $this->getResponseDataFormatter($className);
-        
-            $obj = $this->updateDataObject($obj, $reqFormatter);
-        
-            $this->getResponse()->setStatusCode(201); // Created
-            $this->getResponse()->addHeader('Content-Type', $responseFormatter->getOutputContentType());
 
-            // Append the default extension for the output format to the Location header
-            // or else we'll use the default (XML)
-            $types = $responseFormatter->supportedExtensions();
-            $type = '';
-            if (count($types)) {
-                $type = ".{$types[0]}";
+            $relation = $reqFormatter->getRealFieldName($className, $relation);
+
+            if (!$obj->hasMethod($relation)) {
+                return $this->notFound();
             }
 
-            $objHref = Director::absoluteURL(self::$api_base . "$obj->class/$obj->ID" . $type);
-            $this->getResponse()->addHeader('Location', $objHref);
-        
-            return $responseFormatter->convertDataObject($obj);
+            if (!Config::inst()->get($className, 'allowed_actions') ||
+                !in_array($relation, Config::inst()->get($className, 'allowed_actions'))) {
+                return $this->permissionFailure();
+            }
+
+            $obj->$relation();
+
+            $this->getResponse()->setStatusCode(204); // No Content
+            return true;
         }
+
+        if (!singleton($className)->canCreate($this->getMember())) {
+            return $this->permissionFailure();
+        }
+        $obj = new $className();
+
+        $reqFormatter = $this->getRequestDataFormatter($className);
+        if (!$reqFormatter) {
+            return $this->unsupportedMediaType();
+        }
+
+        $responseFormatter = $this->getResponseDataFormatter($className);
+
+        try {
+            /** @var DataObject|string $obj */
+            $obj = $this->updateDataObject($obj, $reqFormatter);
+        } catch (ValidationException $e) {
+            return $this->validationFailure($responseFormatter, $e->getResult());
+        }
+
+        if (is_string($obj)) {
+            return $obj;
+        }
+
+        $this->getResponse()->setStatusCode(201); // Created
+        $this->getResponse()->addHeader('Content-Type', $responseFormatter->getOutputContentType());
+
+        // Append the default extension for the output format to the Location header
+        // or else we'll use the default (XML)
+        $types = $responseFormatter->supportedExtensions();
+        $type = '';
+        if (count($types)) {
+            $type = ".{$types[0]}";
+        }
+
+        $urlSafeClassName = $this->sanitiseClassName(get_class($obj));
+        $apiBase = $this->config()->api_base;
+        $objHref = Director::absoluteURL($apiBase . "$urlSafeClassName/$obj->ID" . $type);
+        $this->getResponse()->addHeader('Location', $objHref);
+
+        return $responseFormatter->convertDataObject($obj);
     }
-    
+
     /**
      * Converts either the given HTTP Body into an array
      * (based on the DataFormatter instance), or returns
@@ -550,7 +601,7 @@ class RestfulServer extends Controller
      *
      * @param DataObject $obj
      * @param DataFormatter $formatter
-     * @return DataObject The passed object
+     * @return DataObject|string The passed object, or "No Content" if incomplete input data is provided
      */
     protected function updateDataObject($obj, $formatter)
     {
@@ -560,32 +611,40 @@ class RestfulServer extends Controller
             $this->getResponse()->setStatusCode(204); // No Content
             return 'No Content';
         }
-        
+
         if (!empty($body)) {
-            $data = $formatter->convertStringToArray($body);
+            $rawdata = $formatter->convertStringToArray($body);
         } else {
             // assume application/x-www-form-urlencoded which is automatically parsed by PHP
-            $data = $this->request->postVars();
+            $rawdata = $this->request->postVars();
         }
-        
+
+        $className = $this->unsanitiseClassName($this->request->param('ClassName'));
+        // update any aliased field names
+        $data = [];
+        foreach ($rawdata as $key => $value) {
+            $newkey = $formatter->getRealFieldName($className, $key);
+            $data[$newkey] = $value;
+        }
+
         // @todo Disallow editing of certain keys in database
-        $data = array_diff_key($data, array('ID', 'Created'));
-        
-        $apiAccess = singleton($this->urlParams['ClassName'])->stat('api_access');
+        $data = array_diff_key($data, ['ID', 'Created']);
+
+        $apiAccess = singleton($className)->config()->api_access;
         if (is_array($apiAccess) && isset($apiAccess['edit'])) {
             $data = array_intersect_key($data, array_combine($apiAccess['edit'], $apiAccess['edit']));
         }
 
         $obj->update($data);
         $obj->write();
-        
+
         return $obj;
     }
-    
+
     /**
      * Gets a single DataObject by ID,
      * through a request like /api/v1/<MyClass>/<MyID>
-     * 
+     *
      * @param string $className
      * @param int $id
      * @param array $params
@@ -593,9 +652,9 @@ class RestfulServer extends Controller
      */
     protected function getObjectQuery($className, $id, $params)
     {
-        return DataList::create($className)->byIDs(array($id));
+        return DataList::create($className)->byIDs([$id]);
     }
-    
+
     /**
      * @param DataObject $obj
      * @param array $params
@@ -607,8 +666,8 @@ class RestfulServer extends Controller
     {
         return $this->getSearchQuery($className, $params, $sort, $limit);
     }
-    
-    
+
+
     /**
      * @param DataObject $obj
      * @param array $params
@@ -621,53 +680,126 @@ class RestfulServer extends Controller
     {
         // The relation method will return a DataList, that getSearchQuery subsequently manipulates
         if ($obj->hasMethod($relationName)) {
-            if ($relationClass = $obj->has_one($relationName)) {
+            // $this->HasOneName() will return a dataobject or null, neither
+            // of which helps us get the classname in a consistent fashion.
+            // So we must use a way that is reliable.
+            if ($relationClass = DataObject::getSchema()->hasOneComponent(get_class($obj), $relationName)) {
                 $joinField = $relationName . 'ID';
-                $list = DataList::create($relationClass)->byIDs(array($obj->$joinField));
+                // Again `byID` will return the wrong type for our purposes. So use `byIDs`
+                $list = DataList::create($relationClass)->byIDs([$obj->$joinField]);
             } else {
                 $list = $obj->$relationName();
             }
-            
-            $apiAccess = singleton($list->dataClass())->stat('api_access');
+
+            $apiAccess = Config::inst()->get($list->dataClass(), 'api_access');
+
+
             if (!$apiAccess) {
                 return false;
             }
-            
+
             return $this->getSearchQuery($list->dataClass(), $params, $sort, $limit, $list);
         }
     }
-    
+
+    /**
+     * @return string
+     */
     protected function permissionFailure()
     {
         // return a 401
         $this->getResponse()->setStatusCode(401);
         $this->getResponse()->addHeader('WWW-Authenticate', 'Basic realm="API Access"');
         $this->getResponse()->addHeader('Content-Type', 'text/plain');
-        return "You don't have access to this item through the API.";
+
+        $reponse = "You don't have access to this item through the API.";
+        $this->extend(__FUNCTION__, $reponse);
+
+        return $reponse;
     }
 
+    /**
+     * @return string
+     */
     protected function notFound()
     {
         // return a 404
         $this->getResponse()->setStatusCode(404);
         $this->getResponse()->addHeader('Content-Type', 'text/plain');
-        return "That object wasn't found";
+
+        $reponse = "That object wasn't found";
+        $this->extend(__FUNCTION__, $reponse);
+
+        return $reponse;
     }
-    
+
+    /**
+     * @return string
+     */
     protected function methodNotAllowed()
     {
         $this->getResponse()->setStatusCode(405);
         $this->getResponse()->addHeader('Content-Type', 'text/plain');
-        return "Method Not Allowed";
+
+        $reponse = "Method Not Allowed";
+        $this->extend(__FUNCTION__, $reponse);
+
+        return $reponse;
     }
-    
+
+    /**
+     * @return string
+     */
     protected function unsupportedMediaType()
     {
         $this->response->setStatusCode(415); // Unsupported Media Type
         $this->getResponse()->addHeader('Content-Type', 'text/plain');
-        return "Unsupported Media Type";
+
+        $reponse = "Unsupported Media Type";
+        $this->extend(__FUNCTION__, $reponse);
+
+        return $reponse;
     }
-    
+
+    /**
+     * @param ValidationResult $result
+     * @return mixed
+     */
+    protected function validationFailure(DataFormatter $responseFormatter, ValidationResult $result)
+    {
+        $this->getResponse()->setStatusCode(400);
+        $this->getResponse()->addHeader('Content-Type', $responseFormatter->getOutputContentType());
+
+        $response = [
+            'type' => ValidationException::class,
+            'messages' => $result->getMessages(),
+        ];
+
+        $this->extend(__FUNCTION__, $response, $result);
+
+        return $responseFormatter->convertArray($response);
+    }
+
+    /**
+     * @param DataFormatter $responseFormatter
+     * @param \Exception $e
+     * @return string
+     */
+    protected function exceptionThrown(DataFormatter $responseFormatter, \Exception $e)
+    {
+        $this->getResponse()->setStatusCode(500);
+        $this->getResponse()->addHeader('Content-Type', $responseFormatter->getOutputContentType());
+
+        $response = [
+            'type' => get_class($e),
+            'message' => $e->getMessage(),
+        ];
+
+        $this->extend(__FUNCTION__, $response, $e);
+
+        return $responseFormatter->convertArray($response);
+    }
+
     /**
      * A function to authenticate a user
      *
@@ -675,83 +807,47 @@ class RestfulServer extends Controller
      */
     protected function authenticate()
     {
-        $authClass = self::config()->authenticator;
-        return $authClass::authenticate();
+        $authClass = $this->config()->authenticator;
+        $member = $authClass::authenticate();
+        Security::setCurrentUser($member);
+        return $member;
     }
-    
+
     /**
      * Return only relations which have $api_access enabled.
      * @todo Respect field level permissions once they are available in core
-     * 
+     *
      * @param string $class
      * @param Member $member
      * @return array
      */
     protected function getAllowedRelations($class, $member = null)
     {
-        $allowedRelations = array();
+        $allowedRelations = [];
         $obj = singleton($class);
-        $relations = (array)$obj->has_one() + (array)$obj->has_many() + (array)$obj->many_many();
+        $relations = (array)$obj->hasOne() + (array)$obj->hasMany() + (array)$obj->manyMany();
         if ($relations) {
             foreach ($relations as $relName => $relClass) {
-                if (singleton($relClass)->stat('api_access')) {
+                $relClass = static::parseRelationClass($relClass);
+
+                //remove dot notation from relation names
+                $parts = explode('.', $relClass);
+                $relClass = array_shift($parts);
+                if (Config::inst()->get($relClass, 'api_access')) {
                     $allowedRelations[] = $relName;
                 }
             }
         }
         return $allowedRelations;
     }
-}
 
-/**
- * Restful server handler for a SS_List
- * 
- * @package framework
- * @subpackage api
- */
-class RestfulServer_List
-{
-    public static $url_handlers = array(
-        '#ID' => 'handleItem',
-    );
-
-    public function __construct($list)
+    /**
+     * Get the current Member, if available
+     *
+     * @return Member|null
+     */
+    protected function getMember()
     {
-        $this->list = $list;
-    }
-    
-    public function handleItem($request)
-    {
-        return new RestulServer_Item($this->list->getById($request->param('ID')));
-    }
-}
-
-/**
- * Restful server handler for a single DataObject
- * 
- * @package framework
- * @subpackage api
- */
-class RestfulServer_Item
-{
-    public static $url_handlers = array(
-        '$Relation' => 'handleRelation',
-    );
-
-    public function __construct($item)
-    {
-        $this->item = $item;
-    }
-    
-    public function handleRelation($request)
-    {
-        $funcName = $request('Relation');
-        $relation = $this->item->$funcName();
-
-        if ($relation instanceof SS_List) {
-            return new RestfulServer_List($relation);
-        } else {
-            return new RestfulServer_Item($relation);
-        }
+        return Security::getCurrentUser();
     }
 }
