@@ -49,6 +49,13 @@ class RestfulServer extends Controller
     public static $default_extension = "xml";
 
     /**
+     * Disables per item permission checks (TEMPORARY ONLY)
+     *
+     * @var array
+     */
+    private static $per_item_permissions = true;
+
+    /**
      * If no extension is given, resolve the request to this mimetype.
      *
      * @var string
@@ -246,9 +253,11 @@ class RestfulServer extends Controller
 
         if ($obj instanceof SS_List) {
             $objs = ArrayList::create($obj->toArray());
-            foreach ($objs as $obj) {
-                if (!$obj->canView($this->getMember())) {
-                    $objs->remove($obj);
+            if ($this->config()->per_item_permissions) {
+                foreach ($objs as $obj) {
+                    if (!$obj->canView($this->getMember())) {
+                        $objs->remove($obj);
+                    }
                 }
             }
             $responseFormatter->setTotalSize($objs->count());
