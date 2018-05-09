@@ -22,7 +22,9 @@
  * @todo i18n integration (e.g. Page/1.xml?lang=de_DE)
  * @todo Access to extendable methods/relations like SiteTree/1/Versions or SiteTree/1/Version/22
  * @todo Respect $api_access array notation in search contexts
- *
+ * @todo Make $allowed_sort_params a configurable option
+ * @todo Make $allowed_dir_params a configurable option
+ * 
  * @package framework
  * @subpackage api
  */
@@ -53,6 +55,20 @@ class RestfulServer extends Controller
      */
     protected static $default_mimetype = "text/xml";
 
+    /**
+     * Sort params that are acceptable for filtering.
+     *
+     * @var array
+     */
+    protected static $allowed_sort_params = array('Created', 'PublishDate');
+
+    /**
+     * Dir params that are acceptable for filtering.
+     *
+     * @var array
+     */
+    protected static $allowed_dir_params = array('asc', 'desc');
+    
     /**
      * @uses authenticate()
      * @var Member
@@ -178,10 +194,10 @@ class RestfulServer extends Controller
     protected function getHandler($className, $id, $relationName)
     {
         $sort = '';
-
-        if ($this->request->getVar('sort')) {
-            $dir = $this->request->getVar('dir');
-            $sort = array($this->request->getVar('sort') => ($dir ? $dir : 'ASC'));
+        
+        if ($this->getSortQuery()) {
+            $dir = $this->getDirQuery();
+            $sort = array($this->getSortQuery() => ($dir ? $dir : 'ASC'));
         }
 
         $limit = array(
@@ -247,6 +263,42 @@ class RestfulServer extends Controller
         return $responseFormatter->convertDataObject($obj, $fields);
     }
 
+    /**
+     * Ensures that the url param passed for the sort param is valid.
+     * This is to prevent sql injection.
+     *
+     * @return array|user_error|null
+     */
+    protected function getSortQuery()
+    {
+        $sortQuery = $this->request->getVar('sort');
+        if (in_array($sortQuery, self::$allowed_sort_params)) {
+            return $sortQuery;
+        } else if ($sortQuery) {
+            user_error('Disallowed Sort parameter', E_USER_ERROR);
+        } else {
+            return null;
+        }
+    }
+
+    /**
+     * Ensures that the url param passed for the dir param is valid.
+     * This is to prevent sql injection.
+     *
+     * @return array|user_error|null
+     */
+    protected function getDirQuery()
+    {
+        $dirQuery = $this->request->getVar('dir');
+        if (in_array(strtolower($dirQuery), self::$allowed_dir_params)) {
+            return $dirQuery;
+        } else if ($dirQuery) {
+            user_error('Disallowed Dir parameter', E_USER_ERROR);
+        } else {
+            return null;
+        }
+    }
+    
     /**
      * Uses the default {@link SearchContext} specified through
      * {@link DataObject::getDefaultSearchContext()} to augument
